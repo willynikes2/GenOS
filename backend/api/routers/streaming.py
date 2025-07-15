@@ -1,74 +1,37 @@
 """
 Streaming router for GenOS API
+Handles WebSocket connections and streaming management
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
-from typing import List, Dict, Any
+from typing import List, Optional, Dict, Any
 import json
 import asyncio
 
-from ..models.database import get_db, Environment, Session as SessionModel, User
-from ..models.schemas import StreamingConnection, StreamingSession, ClientType
-from ..routers.auth import get_current_active_user
+from ..models.database import get_db, Environment, User
+from ..models.schemas import ClientType
+from ..routers.auth import get_current_active_user, get_user_from_token
 from ..core.logging import get_logger
+from ...streaming.gateway import streaming_gateway, StreamingProtocol, StreamQuality
 
 logger = get_logger(__name__)
 router = APIRouter()
 
-# Active WebSocket connections
-active_connections: Dict[int, List[WebSocket]] = {}
-
-class ConnectionManager:
-    """Manage WebSocket connections for streaming"""
-    
-    def __init__(self):
-        self.active_connections: Dict[int, List[WebSocket]] = {}
-    
-    async def connect(self, websocket: WebSocket, environment_id: int):
-        """Accept a WebSocket connection"""
-        await websocket.accept()
-        if environment_id not in self.active_connections:
-            self.active_connections[environment_id] = []
-        self.active_connections[environment_id].append(websocket)
-        logger.info(f"WebSocket connected for environment {environment_id}")
-    
-    def disconnect(self, websocket: WebSocket, environment_id: int):
-        """Remove a WebSocket connection"""
-        if environment_id in self.active_connections:
-            if websocket in self.active_connections[environment_id]:
-                self.active_connections[environment_id].remove(websocket)
-            if not self.active_connections[environment_id]:
-                del self.active_connections[environment_id]
-        logger.info(f"WebSocket disconnected for environment {environment_id}")
-    
-    async def send_personal_message(self, message: str, websocket: WebSocket):
-        """Send a message to a specific WebSocket"""
-        await websocket.send_text(message)
-    
-    async def broadcast_to_environment(self, message: str, environment_id: int):
-        """Broadcast a message to all connections for an environment"""
-        if environment_id in self.active_connections:
-            for connection in self.active_connections[environment_id]:
-                try:
-                    await connection.send_text(message)
-                except:
-                    # Remove dead connections
-                    self.active_connections[environment_id].remove(connection)
-
-manager = ConnectionManager()
-
-@router.post("/{environment_id}/connect", response_model=Dict[str, Any])
+@router.post("/connections")
 async def create_streaming_connection(
-    environment_id: int,
-    connection_request: StreamingConnection,
+    env_id: int,
+    client_type: ClientType = ClientType.WEB,
+    protocol: StreamingProtocol = StreamingProtocol.SPICE,
+    quality: StreamQuality = StreamQuality.AUTO,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
-    """Create a streaming connection to an environment"""
+    """Create a new streaming connection"""
+    
     # Verify environment exists and belongs to user
     environment = db.query(Environment).filter(
-        Environment.id == environment_id,
+        Environment.id == env_id,
         Environment.user_id == current_user.id
     ).first()
     
@@ -81,211 +44,363 @@ async def create_streaming_connection(
     if environment.status != "running":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Environment is not running (status: {environment.status})"
+            detail=f"Environment must be running to create streaming connection. Current status: {environment.status}"
         )
     
-    # Create session record
-    session = SessionModel(
-        user_id=current_user.id,
-        environment_id=environment_id,
-        client_type=connection_request.client_type,
-        client_info={"protocol": connection_request.protocol, "quality": connection_request.quality}
-    )
-    
-    db.add(session)
-    db.commit()
-    db.refresh(session)
-    
-    # Generate connection info
-    connection_info = {
-        "session_id": session.id,
-        "environment_id": environment_id,
-        "streaming_url": environment.streaming_url or f"ws://localhost:8000/api/v1/streaming/{environment_id}/ws",
-        "protocol": connection_request.protocol,
-        "quality": connection_request.quality,
-        "controls": {
-            "keyboard": True,
-            "mouse": True,
-            "clipboard": True,
-            "audio": True
+    try:
+        # Create streaming connection
+        connection_id = await streaming_gateway.create_connection(
+            str(env_id),
+            current_user.id,
+            client_type,
+            protocol,
+            quality
+        )
+        
+        logger.info(f"Streaming connection {connection_id} created for environment {env_id}")
+        
+        return {
+            "connection_id": connection_id,
+            "websocket_url": f"ws://localhost:8765/{connection_id}",
+            "protocol": protocol.value,
+            "quality": quality.value,
+            "status": "created"
         }
-    }
-    
-    logger.info(f"Streaming connection created for environment {environment_id} by user {current_user.username}")
-    
-    return connection_info
-
-@router.websocket("/{environment_id}/ws")
-async def websocket_endpoint(websocket: WebSocket, environment_id: int):
-    """WebSocket endpoint for streaming"""
-    await manager.connect(websocket, environment_id)
-    
-    try:
-        # Send initial connection message
-        await manager.send_personal_message(
-            json.dumps({
-                "type": "connection",
-                "status": "connected",
-                "environment_id": environment_id
-            }),
-            websocket
-        )
         
-        # Start streaming simulation (in real implementation, this would connect to SPICE/RDP)
-        asyncio.create_task(simulate_stream(websocket, environment_id))
-        
-        while True:
-            # Receive messages from client (input events)
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            
-            # Handle different message types
-            if message.get("type") == "input":
-                await handle_input_event(message, environment_id)
-            elif message.get("type") == "control":
-                await handle_control_command(message, environment_id)
-            
-    except WebSocketDisconnect:
-        manager.disconnect(websocket, environment_id)
-        logger.info(f"WebSocket disconnected for environment {environment_id}")
-
-@router.get("/{environment_id}/sessions", response_model=List[StreamingSession])
-async def list_streaming_sessions(
-    environment_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
-):
-    """List active streaming sessions for an environment"""
-    # Verify environment belongs to user
-    environment = db.query(Environment).filter(
-        Environment.id == environment_id,
-        Environment.user_id == current_user.id
-    ).first()
-    
-    if not environment:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Environment not found"
-        )
-    
-    sessions = db.query(SessionModel).filter(
-        SessionModel.environment_id == environment_id,
-        SessionModel.is_active == True
-    ).all()
-    
-    return sessions
-
-@router.delete("/{environment_id}/sessions/{session_id}")
-async def terminate_streaming_session(
-    environment_id: int,
-    session_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
-):
-    """Terminate a streaming session"""
-    # Verify environment belongs to user
-    environment = db.query(Environment).filter(
-        Environment.id == environment_id,
-        Environment.user_id == current_user.id
-    ).first()
-    
-    if not environment:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Environment not found"
-        )
-    
-    session = db.query(SessionModel).filter(
-        SessionModel.id == session_id,
-        SessionModel.environment_id == environment_id
-    ).first()
-    
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found"
-        )
-    
-    # Mark session as inactive
-    session.is_active = False
-    session.ended_at = datetime.utcnow()
-    db.commit()
-    
-    # Disconnect WebSocket if active
-    if environment_id in manager.active_connections:
-        await manager.broadcast_to_environment(
-            json.dumps({
-                "type": "session_terminated",
-                "session_id": session_id
-            }),
-            environment_id
-        )
-    
-    logger.info(f"Streaming session {session_id} terminated for environment {environment_id}")
-    
-    return {"message": "Session terminated"}
-
-# Helper functions
-async def simulate_stream(websocket: WebSocket, environment_id: int):
-    """Simulate streaming data (placeholder for real SPICE/RDP integration)"""
-    frame_count = 0
-    
-    try:
-        while True:
-            # Simulate frame data
-            frame_data = {
-                "type": "frame",
-                "frame_id": frame_count,
-                "timestamp": asyncio.get_event_loop().time(),
-                "data": f"simulated_frame_data_{frame_count}",
-                "width": 1920,
-                "height": 1080
-            }
-            
-            await manager.send_personal_message(
-                json.dumps(frame_data),
-                websocket
-            )
-            
-            frame_count += 1
-            await asyncio.sleep(1/30)  # 30 FPS simulation
-            
     except Exception as e:
-        logger.error(f"Streaming simulation error: {str(e)}")
+        logger.error(f"Failed to create streaming connection: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create streaming connection: {str(e)}"
+        )
 
-async def handle_input_event(message: Dict[str, Any], environment_id: int):
-    """Handle input events from client"""
-    input_type = message.get("input_type")
+@router.get("/connections/{connection_id}")
+async def get_connection_info(
+    connection_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get streaming connection information"""
     
-    if input_type == "keyboard":
-        # Handle keyboard input
-        key = message.get("key")
-        action = message.get("action")  # press, release
-        logger.debug(f"Keyboard input: {key} {action} for environment {environment_id}")
+    try:
+        connection_info = await streaming_gateway.get_connection_info(connection_id)
         
-    elif input_type == "mouse":
-        # Handle mouse input
-        x = message.get("x")
-        y = message.get("y")
-        button = message.get("button")
-        action = message.get("action")  # move, click, release
-        logger.debug(f"Mouse input: {action} at ({x}, {y}) button {button} for environment {environment_id}")
+        if not connection_info:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Connection not found"
+            )
         
-    elif input_type == "touch":
-        # Handle touch input (mobile)
-        touches = message.get("touches", [])
-        logger.debug(f"Touch input: {len(touches)} touches for environment {environment_id}")
+        # Verify user owns the connection
+        if connection_info["user_id"] != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied"
+            )
+        
+        return connection_info
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get connection info: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get connection info"
+        )
 
-async def handle_control_command(message: Dict[str, Any], environment_id: int):
-    """Handle control commands from client"""
-    command = message.get("command")
+@router.patch("/connections/{connection_id}/quality")
+async def update_connection_quality(
+    connection_id: str,
+    quality: StreamQuality,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Update streaming quality for a connection"""
     
-    if command == "disconnect":
-        logger.info(f"Disconnect command received for environment {environment_id}")
-    elif command == "quality_change":
-        quality = message.get("quality")
-        logger.info(f"Quality change to {quality} for environment {environment_id}")
-    elif command == "fullscreen":
-        fullscreen = message.get("enabled")
-        logger.info(f"Fullscreen {'enabled' if fullscreen else 'disabled'} for environment {environment_id}")
+    try:
+        # Verify connection exists and belongs to user
+        connection_info = await streaming_gateway.get_connection_info(connection_id)
+        
+        if not connection_info:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Connection not found"
+            )
+        
+        if connection_info["user_id"] != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied"
+            )
+        
+        # Update quality
+        success = await streaming_gateway.update_quality(connection_id, quality)
+        
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to update quality"
+            )
+        
+        return {"message": "Quality updated", "quality": quality.value}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update connection quality: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update quality"
+        )
+
+@router.delete("/connections/{connection_id}")
+async def disconnect_streaming_connection(
+    connection_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Disconnect a streaming connection"""
+    
+    try:
+        # Verify connection exists and belongs to user
+        connection_info = await streaming_gateway.get_connection_info(connection_id)
+        
+        if not connection_info:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Connection not found"
+            )
+        
+        if connection_info["user_id"] != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied"
+            )
+        
+        # Disconnect
+        success = await streaming_gateway.disconnect_client(connection_id)
+        
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to disconnect"
+            )
+        
+        return {"message": "Connection disconnected"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to disconnect connection: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to disconnect"
+        )
+
+@router.get("/protocols")
+async def get_supported_protocols():
+    """Get list of supported streaming protocols"""
+    return {
+        "protocols": [
+            {
+                "name": "SPICE",
+                "value": "spice",
+                "description": "Simple Protocol for Independent Computing Environments",
+                "features": ["high_performance", "audio", "clipboard", "usb_redirection"],
+                "recommended_for": ["linux", "desktop_applications"]
+            },
+            {
+                "name": "RDP",
+                "value": "rdp",
+                "description": "Remote Desktop Protocol",
+                "features": ["windows_native", "audio", "clipboard", "file_transfer"],
+                "recommended_for": ["windows", "office_applications"]
+            },
+            {
+                "name": "VNC",
+                "value": "vnc",
+                "description": "Virtual Network Computing",
+                "features": ["cross_platform", "simple", "lightweight"],
+                "recommended_for": ["basic_desktop", "troubleshooting"]
+            },
+            {
+                "name": "WebRTC",
+                "value": "webrtc",
+                "description": "Web Real-Time Communication",
+                "features": ["low_latency", "browser_native", "peer_to_peer"],
+                "recommended_for": ["web_browsers", "real_time_interaction"]
+            }
+        ]
+    }
+
+@router.get("/quality-profiles")
+async def get_quality_profiles():
+    """Get available streaming quality profiles"""
+    return {
+        "profiles": [
+            {
+                "name": "Auto",
+                "value": "auto",
+                "description": "Automatically adjust quality based on network conditions",
+                "resolution": "adaptive",
+                "frame_rate": "adaptive",
+                "compression": "adaptive"
+            },
+            {
+                "name": "Low",
+                "value": "low",
+                "description": "Optimized for slow connections",
+                "resolution": "1024x768",
+                "frame_rate": "15fps",
+                "compression": "high"
+            },
+            {
+                "name": "Medium",
+                "value": "medium",
+                "description": "Balanced quality and performance",
+                "resolution": "1280x720",
+                "frame_rate": "24fps",
+                "compression": "medium"
+            },
+            {
+                "name": "High",
+                "value": "high",
+                "description": "Best quality for fast connections",
+                "resolution": "1920x1080",
+                "frame_rate": "30fps",
+                "compression": "low"
+            }
+        ]
+    }
+
+@router.websocket("/ws/{connection_id}")
+async def websocket_endpoint(websocket: WebSocket, connection_id: str):
+    """WebSocket endpoint for streaming connections"""
+    
+    await websocket.accept()
+    
+    try:
+        # Connect to streaming gateway
+        success = await streaming_gateway.connect_websocket(connection_id, websocket)
+        
+        if not success:
+            await websocket.close(code=4004, reason="Invalid connection ID")
+            return
+        
+        logger.info(f"WebSocket connected for streaming connection {connection_id}")
+        
+        # Handle messages
+        while True:
+            try:
+                # Receive message from client
+                data = await websocket.receive_text()
+                message = json.loads(data)
+                
+                # Handle different message types
+                message_type = message.get("type")
+                
+                if message_type == "input":
+                    # Forward input to streaming gateway
+                    await streaming_gateway.handle_input_event(connection_id, message)
+                
+                elif message_type == "ping":
+                    # Respond to ping
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                
+                elif message_type == "quality_change":
+                    # Handle quality change
+                    quality = StreamQuality(message.get("quality", "auto"))
+                    await streaming_gateway.update_quality(connection_id, quality)
+                
+                elif message_type == "resolution_change":
+                    # Handle resolution change
+                    # This would be forwarded to the streaming gateway
+                    pass
+                
+                else:
+                    logger.warning(f"Unknown message type: {message_type}")
+                
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON received from {connection_id}")
+            except Exception as e:
+                logger.error(f"Error handling WebSocket message: {str(e)}")
+                break
+    
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for connection {connection_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error for connection {connection_id}: {str(e)}")
+    finally:
+        # Clean up connection
+        try:
+            await streaming_gateway.disconnect_client(connection_id)
+        except:
+            pass
+
+@router.get("/stats")
+async def get_streaming_stats(
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get streaming statistics"""
+    
+    try:
+        # Get user's active connections
+        user_connections = []
+        
+        for connection_id, connection in streaming_gateway.connections.items():
+            if connection.user_id == current_user.id:
+                user_connections.append({
+                    "connection_id": connection_id,
+                    "env_id": connection.env_id,
+                    "protocol": connection.protocol.value,
+                    "quality": connection.quality.value,
+                    "state": connection.state.value,
+                    "bandwidth_usage": connection.bandwidth_usage,
+                    "frame_rate": connection.frame_rate,
+                    "resolution": connection.resolution,
+                    "created_at": connection.created_at,
+                    "last_activity": connection.last_activity
+                })
+        
+        return {
+            "user_id": current_user.id,
+            "active_connections": len(user_connections),
+            "connections": user_connections,
+            "total_bandwidth": sum(conn["bandwidth_usage"] for conn in user_connections)
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get streaming stats: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get streaming stats"
+        )
+
+@router.get("/health")
+async def streaming_health_check():
+    """Check streaming gateway health"""
+    
+    try:
+        gateway_status = {
+            "running": streaming_gateway.running,
+            "active_connections": len(streaming_gateway.connections),
+            "active_environments": len(streaming_gateway.environment_connections),
+            "websocket_server": streaming_gateway.websocket_server is not None,
+            "spice_servers": len(streaming_gateway.spice_servers),
+            "rdp_servers": len(streaming_gateway.rdp_servers)
+        }
+        
+        overall_status = "healthy" if gateway_status["running"] else "unhealthy"
+        
+        return {
+            "status": overall_status,
+            "gateway": gateway_status,
+            "timestamp": asyncio.get_event_loop().time()
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get streaming health: {str(e)}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": asyncio.get_event_loop().time()
+        }
 

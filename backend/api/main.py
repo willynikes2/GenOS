@@ -17,6 +17,7 @@ from .models import database
 from .core.config import settings
 from .core.logging import setup_logging
 from ..orchestration.engine import orchestration_engine
+from ..streaming.gateway import streaming_gateway
 
 # Setup logging
 setup_logging()
@@ -36,10 +37,15 @@ async def lifespan(app: FastAPI):
     logger.info("Starting orchestration engine")
     await orchestration_engine.start()
     
+    # Initialize streaming gateway
+    logger.info("Starting streaming gateway")
+    await streaming_gateway.start()
+    
     yield
     
     # Shutdown
     logger.info("Shutting down GenOS Backend API")
+    await streaming_gateway.stop()
     await orchestration_engine.stop()
     await database.disconnect()
 
@@ -83,6 +89,9 @@ async def health_check():
     # Check orchestration engine status
     orchestration_status = "running" if orchestration_engine.running else "stopped"
     
+    # Check streaming gateway status
+    streaming_status = "running" if streaming_gateway.running else "stopped"
+    
     return {
         "status": "healthy",
         "version": "1.0.0",
@@ -90,7 +99,10 @@ async def health_check():
             "database": "connected",
             "redis": "connected",
             "orchestration_engine": orchestration_status,
-            "vm_runtime": "available"
+            "streaming_gateway": streaming_status,
+            "vm_runtime": "available",
+            "active_connections": len(streaming_gateway.connections),
+            "active_environments": len(orchestration_engine.environments)
         }
     }
 
@@ -136,11 +148,24 @@ async def get_system_status():
             "resource_utilization": orchestration_engine.resource_pool.get_utilization()
         }
         
+        # Get streaming gateway status
+        streaming_status = {
+            "running": streaming_gateway.running,
+            "active_connections": len(streaming_gateway.connections),
+            "active_environments": len(streaming_gateway.environment_connections),
+            "websocket_server": streaming_gateway.websocket_server is not None,
+            "protocols": {
+                "spice_servers": len(streaming_gateway.spice_servers),
+                "rdp_servers": len(streaming_gateway.rdp_servers)
+            }
+        }
+        
         return {
             "system": "GenOS",
             "version": "1.0.0",
             "status": "operational",
             "orchestration": orchestration_status,
+            "streaming": streaming_status,
             "uptime": "running"  # TODO: Calculate actual uptime
         }
     except Exception as e:
