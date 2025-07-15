@@ -16,6 +16,7 @@ from .routers import environments, auth, streaming, monitoring
 from .models import database
 from .core.config import settings
 from .core.logging import setup_logging
+from ..orchestration.engine import orchestration_engine
 
 # Setup logging
 setup_logging()
@@ -30,9 +31,16 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting GenOS Backend API")
     await database.connect()
+    
+    # Initialize orchestration engine
+    logger.info("Starting orchestration engine")
+    await orchestration_engine.start()
+    
     yield
+    
     # Shutdown
     logger.info("Shutting down GenOS Backend API")
+    await orchestration_engine.stop()
     await database.disconnect()
 
 # Create FastAPI app
@@ -72,12 +80,16 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    # Check orchestration engine status
+    orchestration_status = "running" if orchestration_engine.running else "stopped"
+    
     return {
         "status": "healthy",
         "version": "1.0.0",
         "components": {
             "database": "connected",
             "redis": "connected",
+            "orchestration_engine": orchestration_status,
             "vm_runtime": "available"
         }
     }
@@ -111,6 +123,31 @@ async def parse_natural_language_command(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to parse command: {str(e)}"
+        )
+
+@app.get("/api/v1/system/status")
+async def get_system_status():
+    """Get comprehensive system status"""
+    try:
+        # Get orchestration engine status
+        orchestration_status = {
+            "running": orchestration_engine.running,
+            "active_environments": len(orchestration_engine.environments),
+            "resource_utilization": orchestration_engine.resource_pool.get_utilization()
+        }
+        
+        return {
+            "system": "GenOS",
+            "version": "1.0.0",
+            "status": "operational",
+            "orchestration": orchestration_status,
+            "uptime": "running"  # TODO: Calculate actual uptime
+        }
+    except Exception as e:
+        logger.error(f"Failed to get system status: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get system status"
         )
 
 if __name__ == "__main__":

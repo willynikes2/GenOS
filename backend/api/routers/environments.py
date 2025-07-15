@@ -15,6 +15,7 @@ from ..models.schemas import (
 from ..routers.auth import get_current_active_user
 from ..nlp.parser import EnvironmentParser
 from ..core.logging import get_logger
+from ...orchestration.engine import orchestration_engine
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -78,7 +79,7 @@ async def create_environment(
 ):
     """Create a new environment"""
     try:
-        # Create environment record
+        # Create environment record in database
         db_environment = Environment(
             user_id=current_user.id,
             name=environment_request.name,
@@ -93,9 +94,27 @@ async def create_environment(
         
         logger.info(f"Environment {db_environment.id} created for user {current_user.username}")
         
-        # Start provisioning in background if auto_start is True
+        # Create environment in orchestration engine
         if environment_request.auto_start:
-            background_tasks.add_task(provision_environment, db_environment.id)
+            try:
+                orchestration_env = await orchestration_engine.create_environment(
+                    str(db_environment.id),
+                    environment_request.specification,
+                    current_user.id
+                )
+                
+                # Update database with orchestration info
+                db_environment.status = EnvironmentStatus.PROVISIONING
+                db.commit()
+                
+            except Exception as e:
+                logger.error(f"Failed to create environment in orchestration engine: {str(e)}")
+                db_environment.status = EnvironmentStatus.ERROR
+                db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to provision environment: {str(e)}"
+                )
         
         return db_environment
         
@@ -121,6 +140,18 @@ async def list_environments(
         query = query.filter(Environment.status == status_filter)
     
     environments = query.offset(skip).limit(limit).all()
+    
+    # Sync status with orchestration engine
+    for env in environments:
+        try:
+            orchestration_status = await orchestration_engine.get_environment_status(str(env.id))
+            if orchestration_status and orchestration_status["status"] != env.status:
+                env.status = orchestration_status["status"]
+                env.streaming_port = orchestration_status.get("streaming_port")
+                db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to sync status for environment {env.id}: {str(e)}")
+    
     return environments
 
 @router.get("/{environment_id}", response_model=EnvironmentSchema)
@@ -140,6 +171,18 @@ async def get_environment(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Environment not found"
         )
+    
+    # Sync status with orchestration engine
+    try:
+        orchestration_status = await orchestration_engine.get_environment_status(str(environment_id))
+        if orchestration_status:
+            environment.status = orchestration_status["status"]
+            environment.streaming_port = orchestration_status.get("streaming_port")
+            if orchestration_status.get("streaming_port"):
+                environment.streaming_url = f"ws://localhost:{orchestration_status['streaming_port']}"
+            db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to sync status for environment {environment_id}: {str(e)}")
     
     return environment
 
@@ -200,16 +243,38 @@ async def start_environment(
             detail=f"Cannot start environment in status: {environment.status}"
         )
     
-    # Update status and start provisioning
-    environment.status = EnvironmentStatus.PROVISIONING
-    environment.updated_at = datetime.utcnow()
-    db.commit()
-    
-    background_tasks.add_task(provision_environment, environment_id)
-    
-    logger.info(f"Environment {environment_id} start requested by user {current_user.username}")
-    
-    return {"message": "Environment start initiated", "status": "provisioning"}
+    try:
+        # Start environment in orchestration engine
+        if environment.status == EnvironmentStatus.REQUESTED:
+            # Create and start new environment
+            from ..models.schemas import EnvironmentSpec
+            spec = EnvironmentSpec(**environment.specification)
+            await orchestration_engine.create_environment(
+                str(environment_id),
+                spec,
+                current_user.id
+            )
+        else:
+            # Start existing environment
+            await orchestration_engine.start_environment(str(environment_id))
+        
+        # Update database status
+        environment.status = EnvironmentStatus.PROVISIONING
+        environment.updated_at = datetime.utcnow()
+        db.commit()
+        
+        logger.info(f"Environment {environment_id} start requested by user {current_user.username}")
+        
+        return {"message": "Environment start initiated", "status": "provisioning"}
+        
+    except Exception as e:
+        logger.error(f"Failed to start environment {environment_id}: {str(e)}")
+        environment.status = EnvironmentStatus.ERROR
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to start environment: {str(e)}"
+        )
 
 @router.post("/{environment_id}/stop")
 async def stop_environment(
@@ -236,11 +301,25 @@ async def stop_environment(
             detail=f"Cannot stop environment in status: {environment.status}"
         )
     
-    background_tasks.add_task(stop_environment_task, environment_id)
-    
-    logger.info(f"Environment {environment_id} stop requested by user {current_user.username}")
-    
-    return {"message": "Environment stop initiated"}
+    try:
+        # Stop environment in orchestration engine
+        await orchestration_engine.stop_environment(str(environment_id))
+        
+        # Update database status
+        environment.status = EnvironmentStatus.SUSPENDED
+        environment.updated_at = datetime.utcnow()
+        db.commit()
+        
+        logger.info(f"Environment {environment_id} stop requested by user {current_user.username}")
+        
+        return {"message": "Environment stop initiated"}
+        
+    except Exception as e:
+        logger.error(f"Failed to stop environment {environment_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to stop environment: {str(e)}"
+        )
 
 @router.delete("/{environment_id}")
 async def delete_environment(
@@ -261,45 +340,63 @@ async def delete_environment(
             detail="Environment not found"
         )
     
-    # Stop environment if running
-    if environment.status == EnvironmentStatus.RUNNING:
-        background_tasks.add_task(stop_environment_task, environment_id)
-    
-    # Mark as terminated
-    environment.status = EnvironmentStatus.TERMINATED
-    environment.terminated_at = datetime.utcnow()
-    environment.updated_at = datetime.utcnow()
-    db.commit()
-    
-    logger.info(f"Environment {environment_id} deleted by user {current_user.username}")
-    
-    return {"message": "Environment deleted"}
+    try:
+        # Terminate environment in orchestration engine
+        await orchestration_engine.terminate_environment(str(environment_id))
+        
+        # Mark as terminated in database
+        environment.status = EnvironmentStatus.TERMINATED
+        environment.terminated_at = datetime.utcnow()
+        environment.updated_at = datetime.utcnow()
+        db.commit()
+        
+        logger.info(f"Environment {environment_id} deleted by user {current_user.username}")
+        
+        return {"message": "Environment deleted"}
+        
+    except Exception as e:
+        logger.error(f"Failed to delete environment {environment_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete environment: {str(e)}"
+        )
 
-# Background tasks
-async def provision_environment(environment_id: int):
-    """Background task to provision an environment"""
-    # TODO: Implement actual VM/container provisioning
-    # This is a placeholder that simulates provisioning
+@router.get("/{environment_id}/status")
+async def get_environment_detailed_status(
+    environment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get detailed environment status including orchestration info"""
+    environment = db.query(Environment).filter(
+        Environment.id == environment_id,
+        Environment.user_id == current_user.id
+    ).first()
     
-    logger.info(f"Starting provisioning for environment {environment_id}")
+    if not environment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Environment not found"
+        )
     
-    # Simulate provisioning delay
-    import asyncio
-    await asyncio.sleep(5)
-    
-    # Update environment status (in real implementation, this would be done by orchestration service)
-    # For now, we'll just log the completion
-    logger.info(f"Environment {environment_id} provisioning completed (simulated)")
-
-async def stop_environment_task(environment_id: int):
-    """Background task to stop an environment"""
-    # TODO: Implement actual VM/container stopping
-    
-    logger.info(f"Stopping environment {environment_id}")
-    
-    # Simulate stop delay
-    import asyncio
-    await asyncio.sleep(2)
-    
-    logger.info(f"Environment {environment_id} stopped (simulated)")
+    try:
+        # Get detailed status from orchestration engine
+        orchestration_status = await orchestration_engine.get_environment_status(str(environment_id))
+        
+        detailed_status = {
+            "environment_id": environment_id,
+            "database_status": environment.status,
+            "orchestration_status": orchestration_status,
+            "created_at": environment.created_at,
+            "updated_at": environment.updated_at
+        }
+        
+        return detailed_status
+        
+    except Exception as e:
+        logger.error(f"Failed to get detailed status for environment {environment_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get environment status: {str(e)}"
+        )
 
